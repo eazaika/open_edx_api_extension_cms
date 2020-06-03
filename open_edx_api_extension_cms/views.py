@@ -11,7 +11,7 @@ from openedx.core.lib.api.permissions import ApiKeyHeaderPermission
 from django.contrib.auth import get_user_model
 from openedx.core.djangoapps.models.course_details import CourseDetails
 from openedx.core.djangoapps.content.course_overviews.models import CourseOverview
-from openedx.core.djangoapps.course_groups.cohorts import set_course_cohort_settings
+from openedx.core.djangoapps.course_groups.cohorts import set_course_cohorted
 from rest_framework import status
 from xmodule.modulestore.django import modulestore
 from util.json_request import JsonResponse, expect_json
@@ -105,9 +105,9 @@ def create_or_update_course(request):
             * course_key: The unique identifier for the course (full slug)
     """
 
-    global_stuff = User.objects.filter(is_staff=True).first()
-    if global_stuff is not None:
-        request.user = global_stuff
+    granted_user = User.objects.filter(is_staff=True).first()
+    if granted_user is not None:
+        request.user = granted_user
     else:
         raise PermissionDenied()
 
@@ -128,8 +128,8 @@ def create_or_update_course(request):
             course_data["start_date"] = format(DEFAULT_START_DATE, "%Y-%m-%d")
         course_data["end_date"] = format(DEFAULT_START_DATE, "%Y-%m-%d")
         course_data["enrollment_end"] = format(DEFAULT_START_DATE, "%Y-%m-%d")
-        CourseDetails.update_from_json(course_key, course_data, global_stuff)
-        set_course_cohort_settings(course_key, is_cohorted=True)
+        CourseDetails.update_from_json(course_key, course_data, granted_user)
+        set_course_cohorted(course_key, True)
         modes = request.json.get("course_modes", [])
         CourseMode.objects.filter(course_id=course_key).exclude(mode_slug__in=[mode["mode"] for mode in modes]).delete()
         for mode in modes:
@@ -146,7 +146,7 @@ def create_or_update_course(request):
             if "description" in mode:
                 mode_params["description"] = mode["description"]
             if "upgrade_deadline" in mode:
-                mode_params["_expiration_datetime"] = mode["upgrade_deadline"]
+                mode_params["_expiration_datetime"] = format(DEFAULT_START_DATE, "%Y-%m-%d")
             CourseMode.objects.update_or_create(course_id=course_key, mode_slug=mode["mode"], defaults=mode_params)
         return JsonResponse({
             'url': reverse_course_url('course_handler', course_key),
@@ -200,28 +200,32 @@ def rerun_course(request):
                     * error: Error description
     """
 
-    global_stuff = User.objects.filter(is_staff=True).first()
-    if global_stuff is not None:
-        request.user = global_stuff
+    granted_user = User.objects.filter(is_staff=True).first()
+    if granted_user is not None:
+        request.user = granted_user
     else:
         raise PermissionDenied()
 
     missing_parameters = {"org", "number", "run", "display_name", "source_course_key"} - request.json.viewkeys()
     if missing_parameters:
+        log.error("Some parameters missing: {}".format(", ".join(missing_parameters)))
         return JsonResponse({"error": "Some parameters missing: {}".format(", ".join(missing_parameters))},
                             status=status.HTTP_400_BAD_REQUEST)
 
     course_key = modulestore().make_course_key(request.json["org"], request.json["number"], request.json["run"])
     course_key = modulestore().has_course(course_key)
     if course_key is not None:
+        log.error('Course with such parameters already exists')
         return JsonResponse({"error": "Course with such parameters already exists"}, status=status.HTTP_400_BAD_REQUEST)
 
     try:
         source_course_key = CourseKey.from_string(request.json["source_course_key"])
     except InvalidKeyError:
+        log.error('Wrong source_course_key format {}'.format(request.json["source_course_key"]))
         return JsonResponse({"error": "Wrong source_course_key format"}, status=status.HTTP_400_BAD_REQUEST)
     source_course_key = modulestore().has_course(source_course_key)
     if source_course_key is None:
+        log.error('Source course {} does not exist'.format(source_course_key))
         return JsonResponse({"error": "Source course doesn't exist"}, status=status.HTTP_400_BAD_REQUEST)
 
     return _create_or_rerun_course(request)
@@ -235,6 +239,7 @@ def check_course_exists(request):
     try:
         course_key = CourseKey.from_string(course_id)
     except InvalidKeyError:
+        log.error('Wrong course_id format {}'.format(course_id))
         return JsonResponse({"error": "Wrong course_id format"}, status=status.HTTP_400_BAD_REQUEST)
     course_key = modulestore().has_course(course_key)
     return JsonResponse({"exists": course_key is not None})
